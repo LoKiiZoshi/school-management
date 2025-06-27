@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'teachers',
     'courses',
     'academics',
+    'fees',
     
     
    
