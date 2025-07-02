@@ -1,15 +1,12 @@
-from django.contrib import admin
 from django.urls import path, include
-from django.conf import settings
-from django.conf.urls.static import static
+from rest_framework.routers import DefaultRouter
+from .views import SubjectViewSet, CourseViewSet, ScheduleViewSet
+
+router = DefaultRouter()
+router.register(r'subjects', SubjectViewSet)
+router.register(r'', CourseViewSet, basename='course')
+router.register(r'schedules', ScheduleViewSet)
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('api/students/', include('students.urls')),
-    path('api/teachers/', include('teachers.urls')),
-    path('api/courses/', include('courses.urls')),
-    path('api/academics/', include('academics.urls')),
-    path('api/fees/', include('fees.urls')),
-    path('api/library/', include('library.urls')),
-    path('api/transport/', include('transport.urls')),
+    path('', include(router.urls)),
 ]
