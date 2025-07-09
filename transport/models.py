@@ -1,15 +1,20 @@
 from django.db import models
+from django.contrib.auth.models import User
 
-class Vehicle(models.Model):
+class Department(models.Model):
     name = models.CharField(max_length=100)
-    capacity = models.IntegerField()
 
-    def __str__(self):
-        return self.name
+class Project(models.Model):
+    name = models.CharField(max_length=100)
+    department = models.ForeignKey(Department, on_delete=models.CASCADE)
+    manager = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
 
-class Booking(models.Model):
-    vehicle = models.ForeignKey(Vehicle, on_delete=models.CASCADE)
-    date = models.DateField()
+class EmployeeProfile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE)
+    department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True)
+    position = models.CharField(max_length=50)
 
-    def __str__(self):
-        return f"Booking for {self.vehicle.name} on {self.date}"
+class ProjectAssignment(models.Model):
+    employee = models.ForeignKey(EmployeeProfile, on_delete=models.CASCADE)
+    project = models.ForeignKey(Project, on_delete=models.CASCADE)
+    assigned_on = models.DateField(auto_now_add=True)
