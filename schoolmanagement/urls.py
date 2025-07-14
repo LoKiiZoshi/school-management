@@ -9,9 +9,8 @@ urlpatterns = [
     path('api/teachers/', include('teachers.urls')),
     path('api/courses/', include('courses.urls')),
     path('api/academics/', include('academics.urls')),
-    path('api/fees/', include('fees.urls')),
     path('api/library/', include('library.urls')),
-    path('api/transport/', include('transport.urls')),
+
 ]
 
 if settings.DEBUG:
