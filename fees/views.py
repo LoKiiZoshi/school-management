@@ -1,207 +1,322 @@
-from django.shortcuts import render, get_object_or_404, redirect
-from django.contrib import messages
-from django.contrib.auth.decorators import login_required
-from django.http import JsonResponse
-from django.core.paginator import Paginator
-from django.db.models import Q, Sum
+from rest_framework import viewsets, status, permissions
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from django.db.models import Q, Sum, Count
 from django.utils import timezone
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.filters import SearchFilter, OrderingFilter
 from .models import *
-from .forms import *
+from .serializers import *
+from .permissions import IsSchoolOwnerOrReadOnly, IsAuthenticated
 
-@login_required
-def fees_dashboard(request):
-    """Dashboard showing overview of fees"""
-    total_students = Student.objects.filter(is_active=True).count()
-    total_pending_payments = FeePayment.objects.filter(status='pending').count()
-    total_overdue_payments = FeePayment.objects.filter(status='overdue').count()
-    total_revenue = FeePayment.objects.filter(status='paid').aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0
+class BaseViewSet(viewsets.ModelViewSet):
+    """Base ViewSet with common functionality"""
+    permission_classes = [IsAuthenticated, IsSchoolOwnerOrReadOnly]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    ordering = ['-created_at']
     
-    recent_payments = FeePayment.objects.filter(status='paid').order_by('-payment_date')[:5]
+    def get_queryset(self):
+        """Filter queryset by school for multi-tenancy"""
+        if hasattr(self.request.user, 'school'):
+            return super().get_queryset().filter(school=self.request.user.school)
+        return super().get_queryset().none()
     
-    context = {
-        'total_students': total_students,
-        'total_pending_payments': total_pending_payments,
-        'total_overdue_payments': total_overdue_payments,
-        'total_revenue': total_revenue,
-        'recent_payments': recent_payments,
-    }
-    return render(request, 'fees/dashboard.html', context)
+    def perform_create(self, serializer):
+        """Auto-assign school on creation"""
+        if hasattr(self.request.user, 'school'):
+            serializer.save(school=self.request.user.school)
 
-@login_required
-def student_list(request):
-    """List all students with pagination and search"""
-    query = request.GET.get('q', '')
-    students = Student.objects.filter(is_active=True)
+class SchoolViewSet(viewsets.ModelViewSet):
+    """School ViewSet"""
+    queryset = School.objects.all()
+    serializer_class = SchoolSerializer
+    permission_classes = [IsAuthenticated]
+    search_fields = ['name', 'code', 'email']
+    filterset_fields = ['status']
     
-    if query:
-        students = students.filter(
-            Q(first_name__icontains=query) |
-            Q(last_name__icontains=query) |
-            Q(student_id__icontains=query) |
-            Q(email__icontains=query)
+    @action(detail=True, methods=['get'])
+    def dashboard(self, request, pk=None):
+        """Get school dashboard statistics"""
+        school = self.get_object()
+        stats = {
+            'total_students': school.students.filter(is_active=True).count(),
+            'total_classes': school.classes.filter(is_active=True).count(),
+            'total_fees_collected': school.payments.aggregate(total=Sum('amount'))['total'] or 0,
+            'pending_fees': school.student_fees.filter(payment_status=PaymentStatusChoices.PENDING).aggregate(total=Sum('amount_due'))['total'] or 0,
+            'overdue_fees': school.student_fees.filter(payment_status=PaymentStatusChoices.OVERDUE).aggregate(total=Sum('amount_due'))['total'] or 0,
+        }
+        return Response(stats)
+
+class AcademicYearViewSet(BaseViewSet):
+    """Academic Year ViewSet"""
+    queryset = AcademicYear.objects.all()
+    serializer_class = AcademicYearSerializer
+    search_fields = ['name']
+    filterset_fields = ['is_current']
+    
+    @action(detail=True, methods=['post'])
+    def set_current(self, request, pk=None):
+        """Set as current academic year"""
+        academic_year = self.get_object()
+        # Reset all other years to not current
+        AcademicYear.objects.filter(school=academic_year.school).update(is_current=False)
+        # Set this year as current
+        academic_year.is_current = True
+        academic_year.save()
+        return Response({'message': 'Academic year set as current'})
+
+class ClassViewSet(BaseViewSet):
+    """Class ViewSet"""
+    queryset = Class.objects.all()
+    serializer_class = ClassSerializer
+    search_fields = ['name', 'grade', 'section']
+    filterset_fields = ['grade', 'section']
+    
+    @action(detail=True, methods=['get'])
+    def students(self, request, pk=None):
+        """Get students in this class"""
+        class_obj = self.get_object()
+        students = class_obj.students.filter(is_active=True)
+        serializer = StudentSerializer(students, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'])
+    def fee_summary(self, request, pk=None):
+        """Get fee summary for this class"""
+        class_obj = self.get_object()
+        summary = {
+            'total_students': class_obj.students.filter(is_active=True).count(),
+            'total_fees_due': class_obj.students.filter(is_active=True).aggregate(
+                total=Sum('fees__amount_due'))['total'] or 0,
+            'total_fees_paid': class_obj.students.filter(is_active=True).aggregate(
+                total=Sum('fees__amount_paid'))['total'] or 0,
+        }
+        return Response(summary)
+
+class StudentViewSet(BaseViewSet):
+    """Student ViewSet"""
+    queryset = Student.objects.all()
+    serializer_class = StudentSerializer
+    search_fields = ['student_id', 'user__first_name', 'user__last_name', 'user__email']
+    filterset_fields = ['current_class', 'status']
+    
+    @action(detail=True, methods=['get'])
+    def fees(self, request, pk=None):
+        """Get student fees"""
+        student = self.get_object()
+        fees = student.fees.all()
+        serializer = StudentFeeSerializer(fees, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'])
+    def payments(self, request, pk=None):
+        """Get student payments"""
+        student = self.get_object()
+        payments = student.payments.all()
+        serializer = PaymentSerializer(payments, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'])
+    def fee_summary(self, request, pk=None):
+        """Get student fee summary"""
+        student = self.get_object()
+        summary = {
+            'total_fees_due': student.fees.aggregate(total=Sum('amount_due'))['total'] or 0,
+            'total_fees_paid': student.fees.aggregate(total=Sum('amount_paid'))['total'] or 0,
+            'pending_fees': student.fees.filter(payment_status=PaymentStatusChoices.PENDING).count(),
+            'overdue_fees': student.fees.filter(payment_status=PaymentStatusChoices.OVERDUE).count(),
+        }
+        return Response(summary)
+
+class FeeStructureViewSet(BaseViewSet):
+    """Fee Structure ViewSet"""
+    queryset = FeeStructure.objects.all()
+    serializer_class = FeeStructureSerializer
+    search_fields = ['fee_type', 'class_grade__name']
+    filterset_fields = ['fee_type', 'class_grade', 'academic_year', 'is_mandatory']
+    
+    @action(detail=False, methods=['post'])
+    def bulk_create(self, request):
+        """Create fee structures for multiple classes"""
+        data = request.data
+        fee_structures = []
+        
+        for item in data.get('fee_structures', []):
+            serializer = self.get_serializer(data=item)
+            if serializer.is_valid():
+                fee_structures.append(serializer.save())
+            else:
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        return Response({
+            'message': f'{len(fee_structures)} fee structures created successfully',
+            'created': len(fee_structures)
+        })
+
+class StudentFeeViewSet(BaseViewSet):
+    """Student Fee ViewSet"""
+    queryset = StudentFee.objects.all()
+    serializer_class = StudentFeeSerializer
+    search_fields = ['student__student_id', 'student__user__first_name', 'student__user__last_name']
+    filterset_fields = ['payment_status', 'fee_structure__fee_type', 'student__current_class']
+    
+    @action(detail=False, methods=['get'])
+    def pending_fees(self, request):
+        """Get all pending fees"""
+        pending_fees = self.get_queryset().filter(payment_status=PaymentStatusChoices.PENDING)
+        serializer = self.get_serializer(pending_fees, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def overdue_fees(self, request):
+        """Get all overdue fees"""
+        overdue_fees = self.get_queryset().filter(
+            payment_status=PaymentStatusChoices.OVERDUE,
+            due_date__lt=timezone.now().date()
         )
+        serializer = self.get_serializer(overdue_fees, many=True)
+        return Response(serializer.data)
     
-    paginator = Paginator(students, 20)
-    page = request.GET.get('page')
-    students = paginator.get_page(page)
-    
-    return render(request, 'fees/student_list.html', {
-        'students': students,
-        'query': query
-    })
+    @action(detail=True, methods=['post'])
+    def apply_discount(self, request, pk=None):
+        """Apply discount to student fee"""
+        student_fee = self.get_object()
+        discount_amount = request.data.get('discount_amount', 0)
+        
+        if discount_amount > student_fee.amount_due:
+            return Response({'error': 'Discount amount cannot exceed fee amount'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+        
+        student_fee.discount_amount = discount_amount
+        student_fee.save()
+        
+        return Response({'message': 'Discount applied successfully'})
 
-@login_required
-def student_detail(request, student_id):
-    """Detailed view of a student's fee information"""
-    student = get_object_or_404(Student, id=student_id)
-    payments = FeePayment.objects.filter(student=student).order_by('-created_at')
-    discounts = StudentDiscount.objects.filter(student=student, is_active=True)
+class PaymentViewSet(BaseViewSet):
+    """Payment ViewSet"""
+    queryset = Payment.objects.all()
+    serializer_class = PaymentSerializer
+    search_fields = ['receipt_number', 'student__student_id', 'student__user__first_name']
+    filterset_fields = ['payment_method', 'payment_date', 'student__current_class']
     
-    # Calculate totals
-    total_due = payments.aggregate(Sum('amount_due'))['amount_due__sum'] or 0
-    total_paid = payments.aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0
-    total_pending = payments.filter(status='pending').aggregate(Sum('amount_due'))['amount_due__sum'] or 0
+    @action(detail=False, methods=['post'])
+    def collect_payment(self, request):
+        """Collect payment for student fees"""
+        student_id = request.data.get('student_id')
+        amount = request.data.get('amount')
+        payment_method = request.data.get('payment_method')
+        fee_allocations = request.data.get('fee_allocations', [])
+        
+        try:
+            student = Student.objects.get(id=student_id, school=request.user.school)
+            
+            # Create payment record
+            payment = Payment.objects.create(
+                school=request.user.school,
+                student=student,
+                receipt_number=f"RCP{timezone.now().strftime('%Y%m%d')}{Payment.objects.count() + 1:04d}",
+                payment_date=timezone.now(),
+                amount=amount,
+                payment_method=payment_method,
+                collected_by=request.user
+            )
+            
+            # Create payment details and update student fees
+            for allocation in fee_allocations:
+                student_fee = StudentFee.objects.get(id=allocation['student_fee_id'])
+                allocation_amount = allocation['amount']
+                
+                PaymentDetail.objects.create(
+                    payment=payment,
+                    student_fee=student_fee,
+                    amount=allocation_amount
+                )
+                
+                student_fee.amount_paid += allocation_amount
+                if student_fee.amount_paid >= student_fee.total_amount:
+                    student_fee.payment_status = PaymentStatusChoices.PAID
+                elif student_fee.amount_paid > 0:
+                    student_fee.payment_status = PaymentStatusChoices.PARTIAL
+                student_fee.save()
+            
+            serializer = PaymentSerializer(payment)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            
+        except Student.DoesNotExist:
+            return Response({'error': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
     
-    context = {
-        'student': student,
-        'payments': payments,
-        'discounts': discounts,
-        'total_due': total_due,
-        'total_paid': total_paid,
-        'total_pending': total_pending,
-    }
-    return render(request, 'fees/student_detail.html', context)
-
-@login_required
-def fee_structure_list(request):
-    """List all fee structures"""
-    structures = FeeStructure.objects.filter(is_active=True).select_related('category')
-    return render(request, 'fees/fee_structure_list.html', {
-        'structures': structures
-    })
-
-@login_required
-def payment_list(request):
-    """List all payments with filters"""
-    status = request.GET.get('status', '')
-    payments = FeePayment.objects.all().select_related('student', 'fee_structure')
-    
-    if status:
-        payments = payments.filter(status=status)
-    
-    paginator = Paginator(payments, 25)
-    page = request.GET.get('page')
-    payments = paginator.get_page(page)
-    
-    return render(request, 'fees/payment_list.html', {
-        'payments': payments,
-        'status': status,
-        'status_choices': FeePayment.PAYMENT_STATUS_CHOICES
-    })
-
-@login_required
-def payment_detail(request, payment_id):
-    """Detailed view of a payment"""
-    payment = get_object_or_404(FeePayment, id=payment_id)
-    return render(request, 'fees/payment_detail.html', {
-        'payment': payment
-    })
-
-@login_required
-def make_payment(request, payment_id):
-    """Process a payment"""
-    payment = get_object_or_404(FeePayment, id=payment_id)
-    
-    if request.method == 'POST':
-        form = PaymentForm(request.POST, instance=payment)
-        if form.is_valid():
-            payment = form.save(commit=False)
-            payment.payment_date = timezone.now().date()
-            payment.status = 'paid'
-            payment.save()
-            messages.success(request, 'Payment processed successfully!')
-            return redirect('fees:payment_detail', payment_id=payment.id)
-    else:
-        form = PaymentForm(instance=payment)
-    
-    return render(request, 'fees/make_payment.html', {
-        'form': form,
-        'payment': payment
-    })
-
-@login_required
-def overdue_payments(request):
-    """List overdue payments"""
-    overdue_payments = FeePayment.objects.filter(
-        status='pending',
-        due_date__lt=timezone.now().date()
-    ).select_related('student', 'fee_structure')
-    
-    # Update status to overdue
-    overdue_payments.update(status='overdue')
-    
-    paginator = Paginator(overdue_payments, 25)
-    page = request.GET.get('page')
-    overdue_payments = paginator.get_page(page)
-    
-    return render(request, 'fees/overdue_payments.html', {
-        'overdue_payments': overdue_payments
-    })
-
-@login_required
-def fee_reports(request):
-    """Generate fee reports"""
-    # Monthly revenue
-    monthly_revenue = FeePayment.objects.filter(
-        status='paid',
-        payment_date__month=timezone.now().month
-    ).aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0
-    
-    # Payment statistics
-    payment_stats = {
-        'total_payments': FeePayment.objects.count(),
-        'paid_payments': FeePayment.objects.filter(status='paid').count(),
-        'pending_payments': FeePayment.objects.filter(status='pending').count(),
-        'overdue_payments': FeePayment.objects.filter(status='overdue').count(),
-    }
-    
-    return render(request, 'fees/reports.html', {
-        'monthly_revenue': monthly_revenue,
-        'payment_stats': payment_stats,
-    })
-
-# fees/forms.py
-from django import forms
-from .models import *
-
-class PaymentForm(forms.ModelForm):
-    class Meta:
-        model = FeePayment
-        fields = ['amount_paid', 'payment_method', 'transaction_id', 'notes']
-        widgets = {
-            'amount_paid': forms.NumberInput(attrs={'class': 'form-control', 'step': '0.01'}),
-            'payment_method': forms.Select(attrs={'class': 'form-control'}),
-            'transaction_id': forms.TextInput(attrs={'class': 'form-control'}),
-            'notes': forms.Textarea(attrs={'class': 'form-control', 'rows': 3}),
+    @action(detail=True, methods=['get'])
+    def receipt(self, request, pk=None):
+        """Generate payment receipt"""
+        payment = self.get_object()
+        receipt_data = {
+            'receipt_number': payment.receipt_number,
+            'payment_date': payment.payment_date,
+            'student_name': payment.student.user.get_full_name(),
+            'student_id': payment.student.student_id,
+            'amount': payment.amount,
+            'payment_method': payment.get_payment_method_display(),
+            'collected_by': payment.collected_by.get_full_name(),
+            'payment_details': PaymentDetailSerializer(payment.payment_details.all(), many=True).data
         }
-
-class StudentForm(forms.ModelForm):
-    class Meta:
-        model = Student
-        fields = ['student_id', 'first_name', 'last_name', 'email', 'phone', 'address', 'date_of_birth']
-        widgets = {
-            'date_of_birth': forms.DateInput(attrs={'type': 'date', 'class': 'form-control'}),
-            'address': forms.Textarea(attrs={'class': 'form-control', 'rows': 3}),
+        return Response(receipt_data)
+    
+    @action(detail=False, methods=['get'])
+    def daily_collection(self, request):
+        """Get daily collection report"""
+        date = request.query_params.get('date', timezone.now().date())
+        payments = self.get_queryset().filter(payment_date__date=date)
+        
+        summary = {
+            'date': date,
+            'total_payments': payments.count(),
+            'total_amount': payments.aggregate(total=Sum('amount'))['total'] or 0,
+            'payment_methods': payments.values('payment_method').annotate(
+                count=Count('id'),
+                total=Sum('amount')
+            ),
+            'payments': PaymentSerializer(payments, many=True).data
         }
+        return Response(summary)
 
-class FeeStructureForm(forms.ModelForm):
-    class Meta:
-        model = FeeStructure
-        fields = ['category', 'name', 'amount', 'frequency', 'due_date', 'late_fee_amount', 'is_mandatory']
-        widgets = {
-            'due_date': forms.DateInput(attrs={'type': 'date', 'class': 'form-control'}),
-            'amount': forms.NumberInput(attrs={'class': 'form-control', 'step': '0.01'}),
-            'late_fee_amount': forms.NumberInput(attrs={'class': 'form-control', 'step': '0.01'}),
-        }from django.shortcuts import render
+class DiscountViewSet(BaseViewSet):
+    """Discount ViewSet"""
+    queryset = Discount.objects.all()
+    serializer_class = DiscountSerializer
+    search_fields = ['name', 'description']
+    filterset_fields = ['discount_type', 'valid_from', 'valid_until']
+    
+    @action(detail=True, methods=['post'])
+    def apply_to_student(self, request, pk=None):
+        """Apply discount to a student"""
+        discount = self.get_object()
+        student_id = request.data.get('student_id')
+        
+        try:
+            student = Student.objects.get(id=student_id, school=request.user.school)
+            
+            # Check if discount already applied
+            if StudentDiscount.objects.filter(student=student, discount=discount).exists():
+                return Response({'error': 'Discount already applied to this student'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+            
+            # Create student discount
+            student_discount = StudentDiscount.objects.create(
+                student=student,
+                discount=discount,
+                approved_by=request.user
+            )
+            
+            return Response({'message': 'Discount applied successfully'})
+            
+        except Student.DoesNotExist:
+            return Response({'error': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
 
-# Create your views here.
+class StudentDiscountViewSet(BaseViewSet):
+    """Student Discount ViewSet"""
+    queryset = StudentDiscount.objects.all()
+    serializer_class = StudentDiscountSerializer
+    search_fields = ['student__student_id', 'discount__name']
+    filterset_fields = ['student', 'discount', 'approved_by']
