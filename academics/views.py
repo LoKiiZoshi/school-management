@@ -16,7 +16,7 @@ from .serializers import (
     ExamTypeSerializer, ExamSerializer, ResultSerializer, 
     AssignmentSerializer, SubmissionSerializer
 )
-from .forms import ExamForm, ResultForm, AssignmentForm, SubmissionForm
+
 
 # REST API ViewSets
 class ExamTypeViewSet(viewsets.ModelViewSet):
